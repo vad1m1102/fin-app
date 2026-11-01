@@ -1,0 +1,18 @@
+[Unit]
+Description=Finance Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fin-app
+ExecStart=/home/ubuntu/fin-app/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+# Змінні середовища
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

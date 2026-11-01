@@ -1,0 +1,30 @@
+# Віртуальне оточення
+.venv/
+venv/
+ENV/
+
+# Токени та секрети
+.env
+password.txt
+*password*
+*secret*
+
+# База даних SQLite
+*.db
+*.sqlite3
+finance.db
+
+# Кеш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Налаштування редакторів
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи та тимчасові файли
+*.log
+*.xlsx
