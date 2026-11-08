@@ -48,19 +48,10 @@ from parser import parse_amount_and_description
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
-# Тимчасове сховище для чернеток перед вибором категорії: {draft_id: {...}}
-pending_drafts: Dict[str, Dict[str, Any]] = {}
-
-# Очікування введення назви нової категорії: {user_id: {"draft_id": Optional[str], "type": str}}
-waiting_custom_category: Dict[int, Dict[str, Any]] = {}
-
 
 def cleanup_old_drafts():
-    """Видаляє чернетки, створені понад 30 хвилин тому."""
-    now = time.time()
-    expired = [k for k, v in pending_drafts.items() if now - v.get("created_at", now) > 1800]
-    for k in expired:
-        pending_drafts.pop(k, None)
+    """Видаляє застарілі чернетки та стани очікування з бази."""
+    database.cleanup_expired_drafts()
 
 
 def format_stats_message(stats: dict) -> str:
@@ -224,11 +215,12 @@ async def handle_type_callback(callback: CallbackQuery):
     cleanup_old_drafts()
     _, draft_id, tx_type = callback.data.split(":")
     
-    draft = pending_drafts.get(draft_id)
+    draft = database.get_draft(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
 
+    database.update_draft_type(draft_id, tx_type)
     draft["type"] = tx_type
     type_name = "🔴 Витрата" if tx_type == "expense" else "🟢 Дохід"
     safe_desc = html.escape(draft['description']) if draft['description'] else ""
@@ -248,7 +240,7 @@ async def handle_type_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("back:"))
 async def handle_back_callback(callback: CallbackQuery):
     draft_id = callback.data.split(":")[1]
-    draft = pending_drafts.get(draft_id)
+    draft = database.get_draft(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
@@ -272,12 +264,13 @@ async def handle_category_callback(callback: CallbackQuery):
     _, draft_id, cat_idx_str = callback.data.split(":")
     cat_idx = int(cat_idx_str)
 
-    draft = pending_drafts.pop(draft_id, None)
+    draft = database.get_draft(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
 
-    tx_type = draft["type"]
+    database.delete_draft(draft_id)
+    tx_type = draft.get("type") or "expense"
     categories = database.get_user_categories(callback.from_user.id, tx_type)
     if 0 <= cat_idx < len(categories):
         category = categories[cat_idx]
@@ -311,8 +304,8 @@ async def handle_category_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("cancel:"))
 async def handle_cancel_callback(callback: CallbackQuery):
     draft_id = callback.data.split(":")[1]
-    pending_drafts.pop(draft_id, None)
-    waiting_custom_category.pop(callback.from_user.id, None)
+    database.delete_draft(draft_id)
+    database.clear_user_state(callback.from_user.id)
     await callback.message.edit_text("❌ Додавання операції скасовано.")
     await callback.answer()
 
@@ -321,10 +314,10 @@ async def handle_cancel_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("newcat:"))
 async def handle_new_cat_callback(callback: CallbackQuery):
     _, draft_id, tx_type = callback.data.split(":")
-    waiting_custom_category[callback.from_user.id] = {
+    database.set_user_state(callback.from_user.id, {
         "draft_id": draft_id,
         "type": tx_type
-    }
+    })
     type_name = "витрат" if tx_type == "expense" else "доходів"
     
     text = (
@@ -372,10 +365,10 @@ async def handle_categories_menu(message: Message):
 @dp.callback_query(F.data.startswith("addcat:"))
 async def handle_add_cat_menu_callback(callback: CallbackQuery):
     tx_type = callback.data.split(":")[1]
-    waiting_custom_category[callback.from_user.id] = {
+    database.set_user_state(callback.from_user.id, {
         "draft_id": None,
         "type": tx_type
-    }
+    })
     type_name = "витрат" if tx_type == "expense" else "доходів"
     await callback.message.answer(
         f"✍️ <b>Введіть назву нової категорії для {type_name}:</b>\n\n"
@@ -448,21 +441,23 @@ async def handle_delete_last_callback(callback: CallbackQuery):
 @dp.message(F.text)
 async def handle_text_message(message: Message):
     # 1. Перевірка: чи очікується введення назви нової категорії
-    if message.from_user.id in waiting_custom_category:
-        wait_info = waiting_custom_category.pop(message.from_user.id)
+    user_state = database.get_user_state(message.from_user.id)
+    if user_state:
         raw_name = message.text.strip()
 
         if len(raw_name) > 35:
-            waiting_custom_category[message.from_user.id] = wait_info
             await message.answer("⚠️ Назва занадто довга (максимум 30 символів). Спробуйте коротшу:")
             return
 
-        tx_type = wait_info["type"]
+        database.clear_user_state(message.from_user.id)
+        tx_type = user_state["type"]
         new_category = raw_name
         database.add_custom_category(message.from_user.id, tx_type, new_category)
 
-        draft_id = wait_info.get("draft_id")
-        draft = pending_drafts.pop(draft_id, None) if draft_id else None
+        draft_id = user_state.get("draft_id")
+        draft = database.get_draft(draft_id) if draft_id else None
+        if draft:
+            database.delete_draft(draft_id)
 
         if draft:
             # Якщо категорія додавалася прямо під час запису операції — зберігаємо операцію
@@ -508,13 +503,7 @@ async def handle_text_message(message: Message):
 
     amount, description = parsed
     draft_id = uuid.uuid4().hex[:8]
-
-    pending_drafts[draft_id] = {
-        "user_id": message.from_user.id,
-        "amount": amount,
-        "description": description,
-        "created_at": time.time()
-    }
+    database.save_draft(draft_id, message.from_user.id, amount, description)
 
     safe_desc = html.escape(description) if description else ""
     desc_str = f"📝 <b>Опис:</b> {safe_desc}\n" if safe_desc else ""
@@ -554,6 +543,39 @@ def detect_proxy() -> Optional[str]:
     return None
 
 
+def create_bot() -> Bot:
+    """Створює екземпляр бота з правильними налаштуваннями сесії та проксі."""
+    proxy = detect_proxy()
+    session = None
+    if proxy:
+        try:
+            session = AiohttpSession(proxy=proxy)
+        except Exception as e:
+            logger.warning(f"Не вдалося ініціалізувати проксі: {e}")
+            session = None
+
+    return Bot(
+        token=BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+
+
+async def process_update(json_data: dict, bot: Optional[Bot] = None):
+    """Обробляє одне вхідне оновлення від Telegram Webhook."""
+    should_close = False
+    if bot is None:
+        bot = create_bot()
+        should_close = True
+    try:
+        from aiogram.types import Update
+        update = Update.model_validate(json_data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+    finally:
+        if should_close:
+            await bot.session.close()
+
+
 async def main():
     database.init_db()
 
@@ -566,25 +588,17 @@ async def main():
         return
 
     proxy = detect_proxy()
-    session = None
     if proxy:
         print(f"🌐 Знайдено проксі: {proxy}")
-        try:
-            session = AiohttpSession(proxy=proxy)
-        except Exception as e:
-            print(f"\n❌ Помилка ініціалізації проксі: {e}")
-            print("👉 Обов'язково виконайте в консолі: pip install --user aiohttp-socks\n")
-            return
     else:
         print("🌐 Пряме підключення (без проксі)")
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    print("🚀 Бот запущений та готовий до роботи!")
-    await dp.start_polling(bot)
+    bot = create_bot()
+    print("🚀 Бот запущений (режим Polling) та готовий до роботи!")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

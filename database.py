@@ -1,4 +1,6 @@
+import json
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
@@ -33,6 +35,23 @@ def init_db():
                 name TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, type, name)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS drafts (
+                draft_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                description TEXT,
+                type TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_states (
+                user_id INTEGER PRIMARY KEY,
+                state_data TEXT NOT NULL,
+                updated_at REAL NOT NULL
             )
         """)
         conn.commit()
@@ -230,4 +249,79 @@ def get_stats(user_id: int, period: str) -> Dict[str, Any]:
             "expense_categories": expense_categories,
             "income_categories": income_categories
         }
+
+
+# Робота з чернетками операцій (надійно зберігаються у SQLite)
+def save_draft(draft_id: str, user_id: int, amount: float, description: str, tx_type: Optional[str] = None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO drafts (draft_id, user_id, amount, description, type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (draft_id, user_id, amount, description, tx_type, time.time()))
+        conn.commit()
+
+
+def update_draft_type(draft_id: str, tx_type: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE drafts SET type = ? WHERE draft_id = ?", (tx_type, draft_id))
+        conn.commit()
+
+
+def get_draft(draft_id: str) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM drafts WHERE draft_id = ?", (draft_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def delete_draft(draft_id: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM drafts WHERE draft_id = ?", (draft_id,))
+        conn.commit()
+
+
+def cleanup_expired_drafts():
+    limit = time.time() - 1800  # 30 хвилин
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM drafts WHERE created_at < ?", (limit,))
+        cursor.execute("DELETE FROM user_states WHERE updated_at < ?", (limit,))
+        conn.commit()
+
+
+# Робота зі станом очікування користувача (наприклад, введення своєї категорії)
+def set_user_state(user_id: int, state_data: Dict[str, Any]):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO user_states (user_id, state_data, updated_at)
+            VALUES (?, ?, ?)
+        """, (user_id, json.dumps(state_data, ensure_ascii=False), time.time()))
+        conn.commit()
+
+
+def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT state_data FROM user_states WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
+        return None
+
+
+def clear_user_state(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        conn.commit()
+
 
