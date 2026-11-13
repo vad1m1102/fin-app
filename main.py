@@ -31,7 +31,7 @@ from datetime import datetime
 
 import database
 from config import BOT_TOKEN
-from excel_exporter import export_transactions_to_excel
+
 from keyboards import (
     get_main_menu,
     get_type_selection_keyboard,
@@ -311,6 +311,7 @@ async def handle_recent(message: Message):
 @dp.message(F.text == "📥 Експорт в Excel")
 @dp.message(Command("export"))
 async def handle_export(message: Message):
+    from excel_exporter import export_transactions_to_excel
     transactions = await asyncio.to_thread(database.get_all_transactions, message.from_user.id)
     if not transactions:
         await message.answer("ℹ️ У вас ще немає збережених операцій для експорту.")
