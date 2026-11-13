@@ -57,6 +57,9 @@ def index():
         "</div></body></html>"
     ), 200
 
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
