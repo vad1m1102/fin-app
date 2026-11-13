@@ -38,13 +38,10 @@ from keyboards import (
     get_category_keyboard,
     get_categories_management_keyboard,
     get_delete_transaction_keyboard,
-    get_stats_keyboard,
-    DEFAULT_EXPENSE_CATEGORIES,
-    DEFAULT_INCOME_CATEGORIES
+    get_stats_keyboard
 )
 from parser import parse_amount_and_description
 
-# Логування
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
@@ -52,6 +49,7 @@ logger = logging.getLogger(__name__)
 RAM_DRAFTS: Dict[str, Dict[str, Any]] = {}
 RAM_USER_STATES: Dict[int, Dict[str, Any]] = {}
 RAM_CATEGORIES_CACHE: Dict[tuple, List[str]] = {}
+RAM_TX_IDS: Dict[str, int] = {}
 
 
 def get_user_categories_fast(user_id: int, tx_type: str) -> List[str]:
@@ -70,13 +68,73 @@ def invalidate_categories_cache(user_id: int):
     RAM_CATEGORIES_CACHE.pop((user_id, "income"), None)
 
 
-async def async_save_draft_type(draft_id: str, tx_type: str):
-    """Фонове оновлення типу чернетки в базі без блокування користувача."""
+# --- Фонові задачі запису в SQLite (не блокують відповідь у Telegram) ---
+
+async def _bg_save_draft(draft_id: str, user_id: int, amount: float, description: str, tx_type: Optional[str] = None):
     try:
-        database.update_draft_type(draft_id, tx_type)
+        await asyncio.to_thread(database.save_draft, draft_id, user_id, amount, description, tx_type)
+    except Exception as e:
+        logger.warning(f"Фонове збереження чернетки: {e}")
+
+
+async def _bg_update_draft_type(draft_id: str, tx_type: str):
+    try:
+        await asyncio.to_thread(database.update_draft_type, draft_id, tx_type)
     except Exception as e:
         logger.warning(f"Фонове оновлення типу чернетки: {e}")
 
+
+async def _bg_delete_draft(draft_id: str):
+    try:
+        await asyncio.to_thread(database.delete_draft, draft_id)
+    except Exception:
+        pass
+
+
+async def _bg_set_user_state(user_id: int, state_data: Dict[str, Any]):
+    try:
+        await asyncio.to_thread(database.set_user_state, user_id, state_data)
+    except Exception:
+        pass
+
+
+async def _bg_clear_user_state(user_id: int):
+    try:
+        await asyncio.to_thread(database.clear_user_state, user_id)
+    except Exception:
+        pass
+
+
+async def _bg_save_transaction(
+    temp_uid: str,
+    draft_id: str,
+    user_id: int,
+    amount: float,
+    tx_type: str,
+    category: str,
+    description: str
+):
+    """Записує фінальну транзакцію в SQLite після того, як користувач уже побачив підтвердження."""
+    try:
+        await asyncio.to_thread(database.delete_draft, draft_id)
+        real_id = await asyncio.to_thread(
+            database.add_transaction,
+            user_id=user_id,
+            amount=amount,
+            tx_type=tx_type,
+            category=category,
+            description=description
+        )
+        RAM_TX_IDS[temp_uid] = real_id
+        # Обмежуємо розмір словника в RAM
+        if len(RAM_TX_IDS) > 1000:
+            oldest_key = next(iter(RAM_TX_IDS))
+            RAM_TX_IDS.pop(oldest_key, None)
+    except Exception as e:
+        logger.error(f"Помилка фонового запису транзакції: {e}")
+
+
+# --- Швидкі обгортки для RAM + фон ---
 
 def get_draft_fast(draft_id: str) -> Optional[Dict[str, Any]]:
     if draft_id in RAM_DRAFTS:
@@ -85,7 +143,7 @@ def get_draft_fast(draft_id: str) -> Optional[Dict[str, Any]]:
 
 
 def save_draft_fast(draft_id: str, user_id: int, amount: float, description: str, tx_type: Optional[str] = None):
-    data = {
+    RAM_DRAFTS[draft_id] = {
         "draft_id": draft_id,
         "user_id": user_id,
         "amount": amount,
@@ -93,19 +151,12 @@ def save_draft_fast(draft_id: str, user_id: int, amount: float, description: str
         "type": tx_type,
         "created_at": time.time()
     }
-    RAM_DRAFTS[draft_id] = data
-    try:
-        database.save_draft(draft_id, user_id, amount, description, tx_type)
-    except Exception as e:
-        logger.warning(f"Фонове збереження чернетки: {e}")
+    asyncio.create_task(_bg_save_draft(draft_id, user_id, amount, description, tx_type))
 
 
 def delete_draft_fast(draft_id: str):
     RAM_DRAFTS.pop(draft_id, None)
-    try:
-        database.delete_draft(draft_id)
-    except Exception:
-        pass
+    asyncio.create_task(_bg_delete_draft(draft_id))
 
 
 def get_user_state_fast(user_id: int) -> Optional[Dict[str, Any]]:
@@ -116,22 +167,15 @@ def get_user_state_fast(user_id: int) -> Optional[Dict[str, Any]]:
 
 def set_user_state_fast(user_id: int, state_data: Dict[str, Any]):
     RAM_USER_STATES[user_id] = state_data
-    try:
-        database.set_user_state(user_id, state_data)
-    except Exception:
-        pass
+    asyncio.create_task(_bg_set_user_state(user_id, state_data))
 
 
 def clear_user_state_fast(user_id: int):
     RAM_USER_STATES.pop(user_id, None)
-    try:
-        database.clear_user_state(user_id)
-    except Exception:
-        pass
+    asyncio.create_task(_bg_clear_user_state(user_id))
 
 
 def cleanup_old_drafts():
-    """Видаляє застарілі чернетки та стани очікування з бази."""
     now = time.time()
     expired = [k for k, v in list(RAM_DRAFTS.items()) if now - v.get("created_at", now) > 1800]
     for k in expired:
@@ -141,6 +185,8 @@ def cleanup_old_drafts():
     except Exception:
         pass
 
+
+# --- Форматування повідомлень ---
 
 def format_stats_message(stats: dict) -> str:
     period_title = stats["period_title"]
@@ -241,7 +287,7 @@ async def handle_help(message: Message):
 @dp.message(F.text == "📊 Статистика")
 @dp.message(Command("stats"))
 async def handle_stats(message: Message):
-    stats = database.get_stats(message.from_user.id, "month")
+    stats = await asyncio.to_thread(database.get_stats, message.from_user.id, "month")
     text = format_stats_message(stats)
     await message.answer(text, reply_markup=get_stats_keyboard())
 
@@ -249,9 +295,9 @@ async def handle_stats(message: Message):
 @dp.message(F.text == "🕒 Останні операції")
 @dp.message(Command("recent"))
 async def handle_recent(message: Message):
-    recent = database.get_recent_transactions(message.from_user.id, limit=5)
+    recent = await asyncio.to_thread(database.get_recent_transactions, message.from_user.id, 5)
     text = format_recent_transactions(recent)
-    
+
     keyboard = None
     if recent:
         keyboard = InlineKeyboardMarkup(
@@ -265,13 +311,13 @@ async def handle_recent(message: Message):
 @dp.message(F.text == "📥 Експорт в Excel")
 @dp.message(Command("export"))
 async def handle_export(message: Message):
-    transactions = database.get_all_transactions(message.from_user.id)
+    transactions = await asyncio.to_thread(database.get_all_transactions, message.from_user.id)
     if not transactions:
         await message.answer("ℹ️ У вас ще немає збережених операцій для експорту.")
         return
 
     await message.answer("⏳ Формую файл Excel...")
-    excel_stream = export_transactions_to_excel(transactions)
+    excel_stream = await asyncio.to_thread(export_transactions_to_excel, transactions)
     filename = f"finance_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
     file_bytes = excel_stream.getvalue()
 
@@ -286,25 +332,25 @@ async def handle_export(message: Message):
 # Обробка вибору періоду статистики
 @dp.callback_query(F.data.startswith("stats:"))
 async def handle_stats_callback(callback: CallbackQuery):
+    asyncio.create_task(callback.answer())
     period = callback.data.split(":")[1]
-    stats = database.get_stats(callback.from_user.id, period)
+    stats = await asyncio.to_thread(database.get_stats, callback.from_user.id, period)
     text = format_stats_message(stats)
 
     try:
         await callback.message.edit_text(text, reply_markup=get_stats_keyboard())
     except Exception:
         pass
-    await callback.answer()
 
 
-# Обробка вибору типу (Витрата / Дохід)
+# Обробка вибору типу (Витрата / Дохід) — МИТТЄВО
 @dp.callback_query(F.data.startswith("type:"))
 async def handle_type_callback(callback: CallbackQuery):
-    # 1. МИТТЄВО знімаємо анімацію натискання з кнопки (відгук за 15-20мс)
-    await callback.answer()
+    # 1. Знімаємо анімацію натискання паралельно
+    asyncio.create_task(callback.answer())
 
     _, draft_id, tx_type = callback.data.split(":")
-    
+
     draft = get_draft_fast(draft_id)
     if not draft:
         await callback.message.edit_text("⏳ Час вибору минув, введіть суму знову.")
@@ -320,21 +366,22 @@ async def handle_type_callback(callback: CallbackQuery):
         f"Оберіть категорію:"
     ).replace(",", " ")
 
-    # Категорії беремо миттєво з пам'яті RAM (0 мс)
     categories = get_user_categories_fast(callback.from_user.id, tx_type)
-    
-    # 2. МИТТЄВО відправляємо кнопки вибору категорій:
+
+    # 2. МИТТЄВО показуємо кнопки вибору категорій
     await callback.message.edit_text(text, reply_markup=get_category_keyboard(draft_id, tx_type, categories))
 
-    # 3. Запис у базу — повністю на фоні (не блокує екран користувача):
-    asyncio.create_task(async_save_draft_type(draft_id, tx_type))
+    # 3. Запис у базу — на фоні
+    asyncio.create_task(_bg_update_draft_type(draft_id, tx_type))
 
 
-# Обробка кнопки "Назад" до вибору типу
+# Обробка кнопки "Назад" до вибору типу — МИТТЄВО
 @dp.callback_query(F.data.startswith("back:"))
 async def handle_back_callback(callback: CallbackQuery):
-    await callback.answer()
+    asyncio.create_task(callback.answer())
     draft_id = callback.data.split(":")[1]
+    clear_user_state_fast(callback.from_user.id)
+
     draft = get_draft_fast(draft_id)
     if not draft:
         await callback.message.edit_text("⏳ Час вибору минув, введіть суму знову.")
@@ -351,11 +398,11 @@ async def handle_back_callback(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=get_type_selection_keyboard(draft_id))
 
 
-# Обробка збереження категорії
+# Обробка збереження категорії — МИТТЄВЕ підтвердження + запис на фоні
 @dp.callback_query(F.data.startswith("cat:"))
 async def handle_category_callback(callback: CallbackQuery):
-    # 1. МИТТЄВО знімаємо анімацію натискання
-    await callback.answer("Збережено!")
+    # 1. Паралельно прибираємо індикатор очікування на кнопці
+    asyncio.create_task(callback.answer("Збережено!"))
 
     _, draft_id, cat_idx_str = callback.data.split(":")
     cat_idx = int(cat_idx_str)
@@ -367,26 +414,16 @@ async def handle_category_callback(callback: CallbackQuery):
 
     tx_type = draft.get("type") or "expense"
     categories = get_user_categories_fast(callback.from_user.id, tx_type)
-    if 0 <= cat_idx < len(categories):
-        category = categories[cat_idx]
-    else:
-        category = "Інше"
+    category = categories[cat_idx] if 0 <= cat_idx < len(categories) else "Інше"
 
-    delete_draft_fast(draft_id)
-
-    # Запис операції у SQLite (з synchronous=NORMAL це лише ~1-2мс)
-    tx_id = database.add_transaction(
-        user_id=callback.from_user.id,
-        amount=draft["amount"],
-        tx_type=tx_type,
-        category=category,
-        description=draft.get("description", "")
-    )
+    # Одразу чистимо чернетку в RAM і генеруємо тимчасовий ID для кнопки видалення
+    RAM_DRAFTS.pop(draft_id, None)
+    temp_uid = uuid.uuid4().hex[:8]
 
     type_title = "🔴 Витрату" if tx_type == "expense" else "🟢 Дохід"
     safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
     desc_line = f"📝 <b>Опис:</b> {safe_desc}\n" if safe_desc else ""
-    
+
     text = (
         f"✅ <b>{type_title} успішно збережено!</b>\n\n"
         f"💰 <b>Сума:</b> {draft['amount']:,.2f} грн\n"
@@ -394,30 +431,44 @@ async def handle_category_callback(callback: CallbackQuery):
         f"{desc_line}"
     ).replace(",", " ")
 
-    # МИТТЄВО показуємо результат:
-    await callback.message.edit_text(text, reply_markup=get_delete_transaction_keyboard(tx_id))
+    # 2. МИТТЄВО показуємо користувачу результат
+    await callback.message.edit_text(text, reply_markup=get_delete_transaction_keyboard(temp_uid))
+
+    # 3. Запускаємо запис у SQLite на фоні
+    asyncio.create_task(
+        _bg_save_transaction(
+            temp_uid=temp_uid,
+            draft_id=draft_id,
+            user_id=callback.from_user.id,
+            amount=draft["amount"],
+            tx_type=tx_type,
+            category=category,
+            description=draft.get("description", "")
+        )
+    )
 
 
-# Скасування додавання операції
+# Скасування додавання операції — МИТТЄВО
 @dp.callback_query(F.data.startswith("cancel:"))
 async def handle_cancel_callback(callback: CallbackQuery):
-    await callback.answer()
+    asyncio.create_task(callback.answer())
     draft_id = callback.data.split(":")[1]
     delete_draft_fast(draft_id)
     clear_user_state_fast(callback.from_user.id)
     await callback.message.edit_text("❌ Додавання операції скасовано.")
 
 
-# Натискання "➕ Своя категорія" під час створення операції
+# Натискання "➕ Своя категорія" під час створення операції — МИТТЄВО
 @dp.callback_query(F.data.startswith("newcat:"))
 async def handle_new_cat_callback(callback: CallbackQuery):
+    asyncio.create_task(callback.answer())
     _, draft_id, tx_type = callback.data.split(":")
     set_user_state_fast(callback.from_user.id, {
         "draft_id": draft_id,
         "type": tx_type
     })
     type_name = "витрат" if tx_type == "expense" else "доходів"
-    
+
     text = (
         f"✍️ <b>Введіть назву вашої категорії для {type_name}:</b>\n\n"
         f"<i>Наприклад: Книги, Сім'я, Косметика...</i>"
@@ -428,15 +479,14 @@ async def handle_new_cat_callback(callback: CallbackQuery):
         ]
     )
     await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
 
 
 # Меню перегляду та керування категоріями
 @dp.message(F.text == "🏷️ Мої категорії")
 @dp.message(Command("categories"))
 async def handle_categories_menu(message: Message):
-    custom_categories = database.get_custom_categories(message.from_user.id)
-    
+    custom_categories = await asyncio.to_thread(database.get_custom_categories, message.from_user.id)
+
     lines = [
         "🏷️ <b>Керування категоріями</b>\n",
         "Бот уже має великий набір стандартних категорій.",
@@ -462,8 +512,9 @@ async def handle_categories_menu(message: Message):
 # Додавання категорії з меню категорій
 @dp.callback_query(F.data.startswith("addcat:"))
 async def handle_add_cat_menu_callback(callback: CallbackQuery):
+    asyncio.create_task(callback.answer())
     tx_type = callback.data.split(":")[1]
-    database.set_user_state(callback.from_user.id, {
+    set_user_state_fast(callback.from_user.id, {
         "draft_id": None,
         "type": tx_type
     })
@@ -472,18 +523,17 @@ async def handle_add_cat_menu_callback(callback: CallbackQuery):
         f"✍️ <b>Введіть назву нової категорії для {type_name}:</b>\n\n"
         f"<i>(Надішліть текстом у чат)</i>"
     )
-    await callback.answer()
 
 
 # Видалення власної категорії
 @dp.callback_query(F.data.startswith("delcat:"))
 async def handle_del_cat_callback(callback: CallbackQuery):
+    asyncio.create_task(callback.answer("Категорію видалено"))
     cat_id = int(callback.data.split(":")[1])
-    database.delete_custom_category(callback.from_user.id, cat_id)
+    await asyncio.to_thread(database.delete_custom_category, callback.from_user.id, cat_id)
     invalidate_categories_cache(callback.from_user.id)
-    
-    # Оновлюємо перелік
-    custom_categories = database.get_custom_categories(callback.from_user.id)
+
+    custom_categories = await asyncio.to_thread(database.get_custom_categories, callback.from_user.id)
     lines = [
         "🏷️ <b>Керування категоріями</b>\n",
         "Категорію видалено!\n"
@@ -504,17 +554,25 @@ async def handle_del_cat_callback(callback: CallbackQuery):
         )
     except Exception:
         pass
-    await callback.answer("Категорію видалено")
 
 
-# Видалення конкретного запису
+# Видалення конкретного запису (підтримує і temp_uid з RAM, і числовий id з БД)
 @dp.callback_query(F.data.startswith("del:"))
 async def handle_delete_callback(callback: CallbackQuery):
-    tx_id = int(callback.data.split(":")[1])
-    success = database.delete_transaction(callback.from_user.id, tx_id)
-    if success:
+    raw_id = callback.data.split(":")[1]
+
+    if not raw_id.isdigit():
+        for _ in range(15):
+            if raw_id in RAM_TX_IDS:
+                break
+            await asyncio.sleep(0.1)
+        tx_id = RAM_TX_IDS.pop(raw_id, None)
+    else:
+        tx_id = int(raw_id)
+
+    if tx_id and await asyncio.to_thread(database.delete_transaction, callback.from_user.id, tx_id):
+        asyncio.create_task(callback.answer("Видалено!"))
         await callback.message.edit_text("🗑️ Запис видалено.")
-        await callback.answer("Видалено!")
     else:
         await callback.answer("Запис не знайдено або вже видалено.", show_alert=True)
 
@@ -522,8 +580,9 @@ async def handle_delete_callback(callback: CallbackQuery):
 # Видалення останньої операції зі списку
 @dp.callback_query(F.data == "del_last")
 async def handle_delete_last_callback(callback: CallbackQuery):
-    deleted = database.delete_last_transaction(callback.from_user.id)
+    deleted = await asyncio.to_thread(database.delete_last_transaction, callback.from_user.id)
     if deleted:
+        asyncio.create_task(callback.answer("Видалено!"))
         safe_desc = html.escape(deleted['description']) if deleted['description'] else ""
         desc = f" ({safe_desc})" if safe_desc else ""
         safe_cat = html.escape(deleted['category'])
@@ -531,7 +590,6 @@ async def handle_delete_last_callback(callback: CallbackQuery):
             f"🗑️ Видалено останню операцію:\n"
             f"<b>{deleted['amount']:,.2f} грн</b> — {safe_cat}{desc}".replace(",", " ")
         )
-        await callback.answer("Видалено!")
     else:
         await callback.answer("Немає записів для видалення.", show_alert=True)
 
@@ -539,8 +597,8 @@ async def handle_delete_last_callback(callback: CallbackQuery):
 # Обробка текстових повідомлень користувача
 @dp.message(F.text)
 async def handle_text_message(message: Message):
-    # 1. Перевірка: чи очікується введення назви нової категорії
-    user_state = database.get_user_state(message.from_user.id)
+    # 1. Швидка перевірка стану з RAM (0 мс замість SELECT до диска)
+    user_state = get_user_state_fast(message.from_user.id)
     if user_state:
         raw_name = message.text.strip()
 
@@ -548,30 +606,23 @@ async def handle_text_message(message: Message):
             await message.answer("⚠️ Назва занадто довга (максимум 30 символів). Спробуйте коротшу:")
             return
 
-        database.clear_user_state(message.from_user.id)
+        clear_user_state_fast(message.from_user.id)
         tx_type = user_state["type"]
         new_category = raw_name
-        database.add_custom_category(message.from_user.id, tx_type, new_category)
+        await asyncio.to_thread(database.add_custom_category, message.from_user.id, tx_type, new_category)
         invalidate_categories_cache(message.from_user.id)
 
         draft_id = user_state.get("draft_id")
-        draft = database.get_draft(draft_id) if draft_id else None
-        if draft:
-            database.delete_draft(draft_id)
+        draft = get_draft_fast(draft_id) if draft_id else None
 
         if draft:
-            # Якщо категорія додавалася прямо під час запису операції — зберігаємо операцію
-            tx_id = database.add_transaction(
-                user_id=message.from_user.id,
-                amount=draft["amount"],
-                tx_type=tx_type,
-                category=new_category,
-                description=draft["description"]
-            )
+            RAM_DRAFTS.pop(draft_id, None)
+            temp_uid = uuid.uuid4().hex[:8]
+
             type_title = "🔴 Витрату" if tx_type == "expense" else "🟢 Дохід"
-            safe_desc = html.escape(draft['description']) if draft['description'] else ""
+            safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
             desc_line = f"📝 <b>Опис:</b> {safe_desc}\n" if safe_desc else ""
-            
+
             text = (
                 f"✨ Створено нову категорію: <b>{html.escape(new_category)}</b>\n\n"
                 f"✅ <b>{type_title} успішно збережено!</b>\n\n"
@@ -579,7 +630,20 @@ async def handle_text_message(message: Message):
                 f"📁 <b>Категорія:</b> {html.escape(new_category)}\n"
                 f"{desc_line}"
             ).replace(",", " ")
-            await message.answer(text, reply_markup=get_delete_transaction_keyboard(tx_id))
+
+            await message.answer(text, reply_markup=get_delete_transaction_keyboard(temp_uid))
+
+            asyncio.create_task(
+                _bg_save_transaction(
+                    temp_uid=temp_uid,
+                    draft_id=draft_id,
+                    user_id=message.from_user.id,
+                    amount=draft["amount"],
+                    tx_type=tx_type,
+                    category=new_category,
+                    description=draft.get("description", "")
+                )
+            )
         else:
             type_name = "витрат" if tx_type == "expense" else "доходів"
             await message.answer(
@@ -589,7 +653,7 @@ async def handle_text_message(message: Message):
             )
         return
 
-    # 2. Якщо це звичайне повідомлення — розпізнаємо суму та опис
+    # 2. Розпізнавання суми та опису
     parsed = parse_amount_and_description(message.text)
     if not parsed:
         await message.answer(
@@ -603,8 +667,8 @@ async def handle_text_message(message: Message):
 
     amount, description = parsed
     draft_id = uuid.uuid4().hex[:8]
-    
-    # 1. Миттєво зберігаємо в RAM пам'ять (0 мс)
+
+    # Зберігаємо в RAM (0 мс), запис у БД піде на фоні
     save_draft_fast(draft_id, message.from_user.id, amount, description)
 
     safe_desc = html.escape(description) if description else ""
@@ -615,35 +679,43 @@ async def handle_text_message(message: Message):
         f"Оберіть тип операції:"
     ).replace(",", " ")
 
-    # 2. МИТТЄВО відправляємо кнопки вибору типу операції!
+    # МИТТЄВО відправляємо кнопки вибору типу операції
     await message.answer(text, reply_markup=get_type_selection_keyboard(draft_id))
 
 
+_cached_proxy: Optional[str] = None
+_proxy_checked: bool = False
+
+
 def detect_proxy() -> Optional[str]:
-    """Визначає, чи потрібно використовувати проксі (наприклад, для PythonAnywhere)."""
-    # 1. Пряма вказівка в .env або змінних оточення
+    """Визначає проксі один раз і кешує результат."""
+    global _cached_proxy, _proxy_checked
+    if _proxy_checked:
+        return _cached_proxy
+
+    _proxy_checked = True
     env_proxy = os.getenv("PROXY_URL")
     if env_proxy:
-        return env_proxy
+        _cached_proxy = env_proxy
+        return _cached_proxy
 
-    # 2. Перевірка наявності proxy.server (специфічно для безкоштовного тарифу PythonAnywhere)
-    try:
-        socket.gethostbyname("proxy.server")
-        return "http://proxy.server:3128"
-    except Exception:
-        pass
-
-    # 3. Перевірка змінних оточення проксі
     for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         val = os.getenv(key)
         if val:
-            return val
+            _cached_proxy = val
+            return _cached_proxy
 
-    # 4. Перевірка шляхів PythonAnywhere
     if os.path.exists("/etc/pythonanywhere") or "pythonanywhere" in os.environ.get("HOSTNAME", "").lower():
-        return "http://proxy.server:3128"
+        _cached_proxy = "http://proxy.server:3128"
+        return _cached_proxy
 
-    return None
+    try:
+        socket.gethostbyname("proxy.server")
+        _cached_proxy = "http://proxy.server:3128"
+    except Exception:
+        _cached_proxy = None
+
+    return _cached_proxy
 
 
 _shared_bot: Optional[Bot] = None
@@ -658,15 +730,11 @@ def get_shared_bot() -> Bot:
 
 
 def create_bot() -> Bot:
-    """Створює екземпляр бота з правильними налаштуваннями сесії та проксі."""
+    """Створює екземпляр бота з оптимізованим пулом з'єднань та DNS-кешем."""
     proxy = detect_proxy()
-    session = None
-    if proxy:
-        try:
-            session = AiohttpSession(proxy=proxy)
-        except Exception as e:
-            logger.warning(f"Не вдалося ініціалізувати проксі: {e}")
-            session = None
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
+    session._connector_init["ttl_dns_cache"] = 300
+    session._connector_init["limit"] = 100
 
     return Bot(
         token=BOT_TOKEN,
@@ -676,17 +744,14 @@ def create_bot() -> Bot:
 
 
 async def process_update(json_data: dict, bot: Optional[Bot] = None):
-    """Обробляє одне вхідне оновлення від Telegram Webhook."""
-    should_close = False
+    """Обробляє одне вхідне оновлення від Telegram Webhook та логує час."""
+    t0 = time.perf_counter()
     if bot is None:
         bot = get_shared_bot()
-    try:
-        from aiogram.types import Update
-        update = Update.model_validate(json_data, context={"bot": bot})
-        await dp.feed_update(bot, update)
-    finally:
-        if should_close:
-            await bot.session.close()
+    from aiogram.types import Update
+    update = Update.model_validate(json_data, context={"bot": bot})
+    await dp.feed_update(bot, update)
+    logger.info(f"Update processed in {(time.perf_counter() - t0) * 1000:.0f} ms")
 
 
 async def main():

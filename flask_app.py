@@ -7,14 +7,13 @@ import threading
 import urllib.request
 from flask import Flask, request, jsonify
 
-# Забезпечуємо знаходження модулів проєкту в sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 import database
 from config import BOT_TOKEN
-from main import get_shared_bot, process_update, dp
+from main import process_update
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 # 1. Ініціалізація бази даних при старті веб-сервера
 database.init_db()
 
-# 2. Створюємо постійний фоновий цикл подій для Keep-Alive з'єднань із Telegram
+# 2. Постійний фоновий цикл подій для Keep-Alive з'єднань із Telegram
 _loop = asyncio.new_event_loop()
 
 
@@ -61,15 +60,15 @@ def index():
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    """Приймає та МИТТЄВО обробляє оновлення від Telegram через постійне Keep-Alive з'єднання."""
+    """Приймає та миттєво обробляє оновлення від Telegram."""
     if request.headers.get("content-type") == "application/json":
-        json_data = request.get_json()
+        json_data = request.get_json(silent=True)
         if json_data:
             future = asyncio.run_coroutine_threadsafe(process_update(json_data), _loop)
             try:
-                future.result(timeout=10)
+                future.result(timeout=5)
             except Exception as e:
-                app.logger.error(f"Помилка обробки вебхука: {e}")
+                app.logger.error(f"Помилка або таймаут обробки вебхука: {e}")
         return "OK", 200
     return "Forbidden", 403
 
@@ -84,7 +83,6 @@ def set_webhook_route():
     webhook_url = f"https://{host}/webhook/{BOT_TOKEN}"
     telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}&drop_pending_updates=True"
 
-    # Використовуємо urllib, який нативно підтримує системний проксі PythonAnywhere
     try:
         req = urllib.request.Request(telegram_api_url)
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -102,7 +100,6 @@ def set_webhook_route():
     else:
         logger_error = "Помилка відповіді"
 
-    # Якщо проксі сервера тимчасово затримався — даємо пряме посилання для активації з браузера
     return (
         f"<h2>⚙️ Активація Webhook</h2>"
         f"<p>Проксі сервера повернув затримку ({logger_error}).</p>"

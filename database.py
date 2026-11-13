@@ -1,18 +1,24 @@
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
-DB_NAME = "finance.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_NAME = os.path.join(BASE_DIR, "finance.db")
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_NAME, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
 
 def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
-        # Вмикаємо режим WAL та synchronous=NORMAL для миттєвої швидкості роботи без затримок диска
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA synchronous=NORMAL;")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +66,7 @@ def init_db():
 
 def add_transaction(user_id: int, amount: float, tx_type: str, category: str, description: Optional[str] = None) -> int:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO transactions (user_id, amount, type, category, description, created_at)
@@ -73,7 +79,7 @@ def add_transaction(user_id: int, amount: float, tx_type: str, category: str, de
 def get_user_categories(user_id: int, tx_type: str) -> List[str]:
     from keyboards import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
     defaults = DEFAULT_EXPENSE_CATEGORIES if tx_type == "expense" else DEFAULT_INCOME_CATEGORIES
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT name FROM custom_categories
@@ -85,7 +91,7 @@ def get_user_categories(user_id: int, tx_type: str) -> List[str]:
 
 
 def get_custom_categories(user_id: int, tx_type: Optional[str] = None) -> List[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         if tx_type:
@@ -107,7 +113,7 @@ def add_custom_category(user_id: int, tx_type: str, name: str) -> bool:
     clean_name = name.strip()
     if not clean_name:
         return False
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -121,7 +127,7 @@ def add_custom_category(user_id: int, tx_type: str, name: str) -> bool:
 
 
 def delete_custom_category(user_id: int, cat_id: int) -> bool:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM custom_categories WHERE id = ? AND user_id = ?", (cat_id, user_id))
         conn.commit()
@@ -129,7 +135,7 @@ def delete_custom_category(user_id: int, cat_id: int) -> bool:
 
 
 def delete_transaction(user_id: int, tx_id: int) -> bool:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM transactions WHERE id = ? AND user_id = ?", (tx_id, user_id))
         conn.commit()
@@ -137,7 +143,7 @@ def delete_transaction(user_id: int, tx_id: int) -> bool:
 
 
 def delete_last_transaction(user_id: int) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
@@ -155,7 +161,7 @@ def delete_last_transaction(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def get_recent_transactions(user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
@@ -169,7 +175,7 @@ def get_recent_transactions(user_id: int, limit: int = 5) -> List[Dict[str, Any]
 
 
 def get_all_transactions(user_id: int) -> List[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
@@ -187,7 +193,6 @@ def get_period_dates(period: str):
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         title = "Сьогодні"
     elif period == "week":
-        # Початок поточного тижня (понеділок)
         start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         title = "Цього тижня"
     elif period == "month":
@@ -207,10 +212,9 @@ def get_period_dates(period: str):
 def get_stats(user_id: int, period: str) -> Dict[str, Any]:
     start_str, period_title = get_period_dates(period)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
 
-        # Загальні суми доходів та витрат
         cursor.execute("""
             SELECT type, COALESCE(SUM(amount), 0)
             FROM transactions
@@ -222,7 +226,6 @@ def get_stats(user_id: int, period: str) -> Dict[str, Any]:
         expense = totals.get("expense", 0.0)
         balance = income - expense
 
-        # Витрати за категоріями
         cursor.execute("""
             SELECT category, SUM(amount) as total
             FROM transactions
@@ -232,7 +235,6 @@ def get_stats(user_id: int, period: str) -> Dict[str, Any]:
         """, (user_id, start_str))
         expense_categories = cursor.fetchall()
 
-        # Доходи за категоріями
         cursor.execute("""
             SELECT category, SUM(amount) as total
             FROM transactions
@@ -252,9 +254,8 @@ def get_stats(user_id: int, period: str) -> Dict[str, Any]:
         }
 
 
-# Робота з чернетками операцій (надійно зберігаються у SQLite)
 def save_draft(draft_id: str, user_id: int, amount: float, description: str, tx_type: Optional[str] = None):
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO drafts (draft_id, user_id, amount, description, type, created_at)
@@ -264,14 +265,14 @@ def save_draft(draft_id: str, user_id: int, amount: float, description: str, tx_
 
 
 def update_draft_type(draft_id: str, tx_type: str):
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE drafts SET type = ? WHERE draft_id = ?", (tx_type, draft_id))
         conn.commit()
 
 
 def get_draft(draft_id: str) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM drafts WHERE draft_id = ?", (draft_id,))
@@ -280,7 +281,7 @@ def get_draft(draft_id: str) -> Optional[Dict[str, Any]]:
 
 
 def delete_draft(draft_id: str):
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM drafts WHERE draft_id = ?", (draft_id,))
         conn.commit()
@@ -288,16 +289,15 @@ def delete_draft(draft_id: str):
 
 def cleanup_expired_drafts():
     limit = time.time() - 1800  # 30 хвилин
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM drafts WHERE created_at < ?", (limit,))
         cursor.execute("DELETE FROM user_states WHERE updated_at < ?", (limit,))
         conn.commit()
 
 
-# Робота зі станом очікування користувача (наприклад, введення своєї категорії)
 def set_user_state(user_id: int, state_data: Dict[str, Any]):
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO user_states (user_id, state_data, updated_at)
@@ -307,7 +307,7 @@ def set_user_state(user_id: int, state_data: Dict[str, Any]):
 
 
 def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT state_data FROM user_states WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
@@ -320,9 +320,7 @@ def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def clear_user_state(user_id: int):
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
         conn.commit()
-
-

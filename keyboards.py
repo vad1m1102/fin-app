@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -35,7 +35,6 @@ DEFAULT_INCOME_CATEGORIES = [
     "💰 Інший дохід"
 ]
 
-# Для зворотної сумісності
 EXPENSE_CATEGORIES = DEFAULT_EXPENSE_CATEGORIES
 INCOME_CATEGORIES = DEFAULT_INCOME_CATEGORIES
 
@@ -68,7 +67,6 @@ def get_type_selection_keyboard(draft_id: str):
 def get_category_keyboard(draft_id: str, tx_type: str, categories: List[str]):
     buttons = []
     
-    # Розміщуємо по 2 кнопки в ряд
     row = []
     for idx, cat in enumerate(categories):
         row.append(InlineKeyboardButton(text=cat, callback_data=f"cat:{draft_id}:{idx}"))
@@ -78,12 +76,10 @@ def get_category_keyboard(draft_id: str, tx_type: str, categories: List[str]):
     if row:
         buttons.append(row)
 
-    # Кнопка додавання своєї категорії
     buttons.append([
         InlineKeyboardButton(text="➕ Своя категорія", callback_data=f"newcat:{draft_id}:{tx_type}")
     ])
 
-    # Кнопки повернення назад або скасування
     buttons.append([
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:{draft_id}"),
         InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cancel:{draft_id}")
@@ -112,7 +108,7 @@ def get_categories_management_keyboard(custom_categories: List[Dict[str, Any]]):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_delete_transaction_keyboard(tx_id: int):
+def get_delete_transaction_keyboard(tx_id: Union[int, str]):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🗑️ Видалити цей запис", callback_data=f"del:{tx_id}")]
