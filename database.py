@@ -10,8 +10,9 @@ DB_NAME = "finance.db"
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Вмикаємо режим WAL (Write-Ahead Logging) для швидкої багатокористувацької роботи
+        # Вмикаємо режим WAL та synchronous=NORMAL для миттєвої швидкості роботи без затримок диска
         cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

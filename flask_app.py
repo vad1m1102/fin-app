@@ -1,6 +1,10 @@
 import asyncio
+import json
+import logging
 import os
 import sys
+import threading
+import urllib.request
 from flask import Flask, request, jsonify
 
 # Забезпечуємо знаходження модулів проєкту в sys.path
@@ -10,12 +14,25 @@ if current_dir not in sys.path:
 
 import database
 from config import BOT_TOKEN
-from main import create_bot, process_update
+from main import get_shared_bot, process_update, dp
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Ініціалізація бази даних при старті веб-сервера
+# 1. Ініціалізація бази даних при старті веб-сервера
 database.init_db()
+
+# 2. Створюємо постійний фоновий цикл подій для Keep-Alive з'єднань із Telegram
+_loop = asyncio.new_event_loop()
+
+
+def _run_bg_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+_bg_thread = threading.Thread(target=_run_bg_loop, args=(_loop,), daemon=True)
+_bg_thread.start()
 
 
 @app.route("/")
@@ -24,13 +41,15 @@ def index():
         "<!DOCTYPE html>"
         "<html lang='uk'><head><meta charset='utf-8'><title>Fin Tracker Bot</title>"
         "<style>body{font-family:sans-serif;padding:40px;background:#f5f7fa;color:#333;text-align:center;}"
-        ".card{background:white;padding:30px;border-radius:12px;max-width:500px;margin:auto;box-shadow:0 4px 12px rgba(0,0,0,0.1);}"
-        "a{display:inline-block;margin:10px;padding:10px 20px;background:#0088cc;color:white;text-decoration:none;border-radius:6px;font-weight:bold;}"
+        ".card{background:white;padding:30px;border-radius:12px;max-width:520px;margin:auto;box-shadow:0 4px 12px rgba(0,0,0,0.1);}"
+        "a{display:inline-block;margin:10px;padding:12px 20px;background:#0088cc;color:white;text-decoration:none;border-radius:6px;font-weight:bold;}"
         "a.danger{background:#d9534f;}"
+        ".badge{display:inline-block;background:#28a745;color:white;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:bold;}"
         "</style></head><body>"
         "<div class='card'>"
-        "<h2>🚀 Fin Tracker Webhook Bot</h2>"
+        "<h2>⚡ Fin Tracker Bot <span class='badge'>Turbo Keep-Alive</span></h2>"
         "<p>Статус: <b>Веб-сервер активний і працює 24/7</b></p>"
+        "<p><small>Миттєва відправка кнопок та постійний пул мережевих з'єднань</small></p>"
         "<hr/>"
         "<p>Керування вебхуком Telegram:</p>"
         "<a href='/set_webhook'>✅ Встановити Webhook</a><br/>"
@@ -42,49 +61,55 @@ def index():
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    """Приймає та обробляє оновлення від Telegram."""
+    """Приймає та МИТТЄВО обробляє оновлення від Telegram через постійне Keep-Alive з'єднання."""
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json()
         if json_data:
-            asyncio.run(process_update(json_data))
+            future = asyncio.run_coroutine_threadsafe(process_update(json_data), _loop)
+            try:
+                future.result(timeout=10)
+            except Exception as e:
+                app.logger.error(f"Помилка обробки вебхука: {e}")
         return "OK", 200
     return "Forbidden", 403
 
 
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook_route():
-    """Встановлює Webhook у Telegram за 1 клік у браузері."""
+    """Встановлює Webhook у Telegram за 1 клік."""
     if not BOT_TOKEN:
         return jsonify({"status": "error", "message": "BOT_TOKEN не задано в .env"}), 500
 
-    # Визначаємо хост PythonAnywhere або поточний домен
     host = request.headers.get("X-Forwarded-Host", request.host)
     webhook_url = f"https://{host}/webhook/{BOT_TOKEN}"
+    telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}&drop_pending_updates=True"
 
-    async def _set():
-        bot = create_bot()
-        try:
-            res = await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-            info = await bot.get_webhook_info()
-            return res, info
-        finally:
-            await bot.session.close()
-
+    # Використовуємо urllib, який нативно підтримує системний проксі PythonAnywhere
     try:
-        res, info = asyncio.run(_set())
-        return (
-            f"<h2>✅ Webhook успішно встановлено!</h2>"
-            f"<p><b>URL:</b> {webhook_url}</p>"
-            f"<p><b>Telegram відповідь:</b> {res}</p>"
-            f"<p><b>Статус у Telegram:</b> {info.url}</p>"
-            f"<br/><a href='/'>⬅️ Назад</a>"
-        ), 200
-    except Exception as e:
-        return (
-            f"<h2>❌ Помилка встановлення Webhook:</h2>"
-            f"<p>{e}</p>"
-            f"<br/><a href='/'>⬅️ Назад</a>"
-        ), 500
+        req = urllib.request.Request(telegram_api_url)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            if res_data.get("ok"):
+                return (
+                    f"<h2>✅ Webhook успішно встановлено!</h2>"
+                    f"<p><b>Webhook URL:</b> {webhook_url}</p>"
+                    f"<p><b>Telegram результат:</b> {res_data.get('description', 'OK')}</p>"
+                    f"<p>Бот уже готовий миттєво приймати повідомлення в Telegram!</p>"
+                    f"<br/><a href='/'>⬅️ Назад</a>"
+                ), 200
+    except Exception as err:
+        logger_error = str(err)
+    else:
+        logger_error = "Помилка відповіді"
+
+    # Якщо проксі сервера тимчасово затримався — даємо пряме посилання для активації з браузера
+    return (
+        f"<h2>⚙️ Активація Webhook</h2>"
+        f"<p>Проксі сервера повернув затримку ({logger_error}).</p>"
+        f"<p><b>Натисніть на посилання нижче для активації вебхука прямо з вашого браузера:</b></p>"
+        f"<p><a href='{telegram_api_url}' target='_blank' style='background:#28a745;padding:12px 24px;font-size:16px;'>👉 Натисніть тут для активації Webhook</a></p>"
+        f"<br/><a href='/'>⬅️ Назад</a>"
+    ), 200
 
 
 @app.route("/webhook_info", methods=["GET"])
@@ -93,22 +118,19 @@ def webhook_info_route():
     if not BOT_TOKEN:
         return jsonify({"status": "error", "message": "BOT_TOKEN не задано в .env"}), 500
 
-    async def _info():
-        bot = create_bot()
-        try:
-            return await bot.get_webhook_info()
-        finally:
-            await bot.session.close()
-
+    telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
     try:
-        info = asyncio.run(_info())
-        return (
-            f"<h2>ℹ️ Інформація про Webhook</h2>"
-            f"<p><b>Поточний URL:</b> {info.url or 'Не встановлено'}</p>"
-            f"<p><b>Очікує обробки оновлень:</b> {info.pending_update_count}</p>"
-            f"<p><b>Остання помилка (якщо є):</b> {info.last_error_message or 'Немає'}</p>"
-            f"<br/><a href='/'>⬅️ Назад</a>"
-        ), 200
+        req = urllib.request.Request(telegram_api_url)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            result = data.get("result", {})
+            return (
+                f"<h2>ℹ️ Інформація про Webhook</h2>"
+                f"<p><b>Поточний URL:</b> {result.get('url') or 'Не встановлено'}</p>"
+                f"<p><b>Очікує обробки оновлень:</b> {result.get('pending_update_count', 0)}</p>"
+                f"<p><b>Остання помилка:</b> {result.get('last_error_message') or 'Немає'}</p>"
+                f"<br/><a href='/'>⬅️ Назад</a>"
+            ), 200
     except Exception as e:
         return f"<h2>❌ Помилка: {e}</h2><br/><a href='/'>⬅️ Назад</a>", 500
 
@@ -119,25 +141,19 @@ def delete_webhook_route():
     if not BOT_TOKEN:
         return jsonify({"status": "error", "message": "BOT_TOKEN не задано в .env"}), 500
 
-    async def _delete():
-        bot = create_bot()
-        try:
-            return await bot.delete_webhook()
-        finally:
-            await bot.session.close()
-
+    telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
     try:
-        res = asyncio.run(_delete())
-        return (
-            f"<h2>🗑️ Webhook видалено!</h2>"
-            f"<p>Telegram відповідь: {res}</p>"
-            f"<br/><a href='/'>⬅️ Назад</a>"
-        ), 200
+        req = urllib.request.Request(telegram_api_url)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return (
+                f"<h2>🗑️ Webhook видалено!</h2>"
+                f"<p>Результат: {data.get('description', 'OK')}</p>"
+                f"<br/><a href='/'>⬅️ Назад</a>"
+            ), 200
     except Exception as e:
         return f"<h2>❌ Помилка: {e}</h2><br/><a href='/'>⬅️ Назад</a>", 500
 
 
 if __name__ == "__main__":
-    # Локальний запуск сервера розробки
     app.run(port=5000, debug=True)
-

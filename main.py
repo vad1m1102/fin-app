@@ -48,10 +48,73 @@ from parser import parse_amount_and_description
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+# Швидкий кеш в оперативній пам'яті (0ms) для миттєвих відповідей користувачеві
+RAM_DRAFTS: Dict[str, Dict[str, Any]] = {}
+RAM_USER_STATES: Dict[int, Dict[str, Any]] = {}
+
+
+def get_draft_fast(draft_id: str) -> Optional[Dict[str, Any]]:
+    if draft_id in RAM_DRAFTS:
+        return RAM_DRAFTS[draft_id]
+    return database.get_draft(draft_id)
+
+
+def save_draft_fast(draft_id: str, user_id: int, amount: float, description: str, tx_type: Optional[str] = None):
+    data = {
+        "draft_id": draft_id,
+        "user_id": user_id,
+        "amount": amount,
+        "description": description,
+        "type": tx_type,
+        "created_at": time.time()
+    }
+    RAM_DRAFTS[draft_id] = data
+    try:
+        database.save_draft(draft_id, user_id, amount, description, tx_type)
+    except Exception as e:
+        logger.warning(f"Фонове збереження чернетки: {e}")
+
+
+def delete_draft_fast(draft_id: str):
+    RAM_DRAFTS.pop(draft_id, None)
+    try:
+        database.delete_draft(draft_id)
+    except Exception:
+        pass
+
+
+def get_user_state_fast(user_id: int) -> Optional[Dict[str, Any]]:
+    if user_id in RAM_USER_STATES:
+        return RAM_USER_STATES[user_id]
+    return database.get_user_state(user_id)
+
+
+def set_user_state_fast(user_id: int, state_data: Dict[str, Any]):
+    RAM_USER_STATES[user_id] = state_data
+    try:
+        database.set_user_state(user_id, state_data)
+    except Exception:
+        pass
+
+
+def clear_user_state_fast(user_id: int):
+    RAM_USER_STATES.pop(user_id, None)
+    try:
+        database.clear_user_state(user_id)
+    except Exception:
+        pass
+
 
 def cleanup_old_drafts():
     """Видаляє застарілі чернетки та стани очікування з бази."""
-    database.cleanup_expired_drafts()
+    now = time.time()
+    expired = [k for k, v in list(RAM_DRAFTS.items()) if now - v.get("created_at", now) > 1800]
+    for k in expired:
+        RAM_DRAFTS.pop(k, None)
+    try:
+        database.cleanup_expired_drafts()
+    except Exception:
+        pass
 
 
 def format_stats_message(stats: dict) -> str:
@@ -215,15 +278,14 @@ async def handle_type_callback(callback: CallbackQuery):
     cleanup_old_drafts()
     _, draft_id, tx_type = callback.data.split(":")
     
-    draft = database.get_draft(draft_id)
+    draft = get_draft_fast(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
 
-    database.update_draft_type(draft_id, tx_type)
     draft["type"] = tx_type
     type_name = "🔴 Витрата" if tx_type == "expense" else "🟢 Дохід"
-    safe_desc = html.escape(draft['description']) if draft['description'] else ""
+    safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
     desc_str = f" ({safe_desc})" if safe_desc else ""
 
     text = (
@@ -232,20 +294,28 @@ async def handle_type_callback(callback: CallbackQuery):
     ).replace(",", " ")
 
     categories = database.get_user_categories(callback.from_user.id, tx_type)
+    
+    # МИТТЄВО відправляємо кнопки вибору категорій:
     await callback.message.edit_text(text, reply_markup=get_category_keyboard(draft_id, tx_type, categories))
     await callback.answer()
+
+    # Оновлюємо тип у фоні:
+    try:
+        database.update_draft_type(draft_id, tx_type)
+    except Exception:
+        pass
 
 
 # Обробка кнопки "Назад" до вибору типу
 @dp.callback_query(F.data.startswith("back:"))
 async def handle_back_callback(callback: CallbackQuery):
     draft_id = callback.data.split(":")[1]
-    draft = database.get_draft(draft_id)
+    draft = get_draft_fast(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
 
-    safe_desc = html.escape(draft['description']) if draft['description'] else ""
+    safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
     desc_str = f"<b>Опис:</b> {safe_desc}\n" if safe_desc else ""
     text = (
         f"💰 <b>Сума:</b> {draft['amount']:,.2f} грн\n"
@@ -260,16 +330,14 @@ async def handle_back_callback(callback: CallbackQuery):
 # Обробка збереження категорії
 @dp.callback_query(F.data.startswith("cat:"))
 async def handle_category_callback(callback: CallbackQuery):
-    cleanup_old_drafts()
     _, draft_id, cat_idx_str = callback.data.split(":")
     cat_idx = int(cat_idx_str)
 
-    draft = database.get_draft(draft_id)
+    draft = get_draft_fast(draft_id)
     if not draft:
         await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
         return
 
-    database.delete_draft(draft_id)
     tx_type = draft.get("type") or "expense"
     categories = database.get_user_categories(callback.from_user.id, tx_type)
     if 0 <= cat_idx < len(categories):
@@ -277,16 +345,19 @@ async def handle_category_callback(callback: CallbackQuery):
     else:
         category = "Інше"
 
+    delete_draft_fast(draft_id)
+
+    # 1. Записуємо в БД
     tx_id = database.add_transaction(
         user_id=callback.from_user.id,
         amount=draft["amount"],
         tx_type=tx_type,
         category=category,
-        description=draft["description"]
+        description=draft.get("description", "")
     )
 
     type_title = "🔴 Витрату" if tx_type == "expense" else "🟢 Дохід"
-    safe_desc = html.escape(draft['description']) if draft['description'] else ""
+    safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
     desc_line = f"📝 <b>Опис:</b> {safe_desc}\n" if safe_desc else ""
     
     text = (
@@ -296,6 +367,7 @@ async def handle_category_callback(callback: CallbackQuery):
         f"{desc_line}"
     ).replace(",", " ")
 
+    # МИТТЄВО показуємо результат і завершуємо анімацію кнопки:
     await callback.message.edit_text(text, reply_markup=get_delete_transaction_keyboard(tx_id))
     await callback.answer("Збережено!")
 
@@ -304,8 +376,8 @@ async def handle_category_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("cancel:"))
 async def handle_cancel_callback(callback: CallbackQuery):
     draft_id = callback.data.split(":")[1]
-    database.delete_draft(draft_id)
-    database.clear_user_state(callback.from_user.id)
+    delete_draft_fast(draft_id)
+    clear_user_state_fast(callback.from_user.id)
     await callback.message.edit_text("❌ Додавання операції скасовано.")
     await callback.answer()
 
@@ -314,10 +386,23 @@ async def handle_cancel_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("newcat:"))
 async def handle_new_cat_callback(callback: CallbackQuery):
     _, draft_id, tx_type = callback.data.split(":")
-    database.set_user_state(callback.from_user.id, {
+    set_user_state_fast(callback.from_user.id, {
         "draft_id": draft_id,
         "type": tx_type
     })
+    type_name = "витрат" if tx_type == "expense" else "доходів"
+    
+    text = (
+        f"✍️ <b>Введіть назву вашої категорії для {type_name}:</b>\n\n"
+        f"<i>Наприклад: Книги, Сім'я, Косметика...</i>"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"back:{draft_id}")]
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
     type_name = "витрат" if tx_type == "expense" else "доходів"
     
     text = (
@@ -503,7 +588,9 @@ async def handle_text_message(message: Message):
 
     amount, description = parsed
     draft_id = uuid.uuid4().hex[:8]
-    database.save_draft(draft_id, message.from_user.id, amount, description)
+    
+    # 1. Миттєво зберігаємо в RAM пам'ять (0 мс)
+    save_draft_fast(draft_id, message.from_user.id, amount, description)
 
     safe_desc = html.escape(description) if description else ""
     desc_str = f"📝 <b>Опис:</b> {safe_desc}\n" if safe_desc else ""
@@ -513,6 +600,7 @@ async def handle_text_message(message: Message):
         f"Оберіть тип операції:"
     ).replace(",", " ")
 
+    # 2. МИТТЄВО відправляємо кнопки вибору типу операції!
     await message.answer(text, reply_markup=get_type_selection_keyboard(draft_id))
 
 
@@ -543,6 +631,17 @@ def detect_proxy() -> Optional[str]:
     return None
 
 
+_shared_bot: Optional[Bot] = None
+
+
+def get_shared_bot() -> Bot:
+    """Повертає або створює спільний екземпляр бота з Keep-Alive з'єднанням."""
+    global _shared_bot
+    if _shared_bot is None:
+        _shared_bot = create_bot()
+    return _shared_bot
+
+
 def create_bot() -> Bot:
     """Створює екземпляр бота з правильними налаштуваннями сесії та проксі."""
     proxy = detect_proxy()
@@ -565,8 +664,7 @@ async def process_update(json_data: dict, bot: Optional[Bot] = None):
     """Обробляє одне вхідне оновлення від Telegram Webhook."""
     should_close = False
     if bot is None:
-        bot = create_bot()
-        should_close = True
+        bot = get_shared_bot()
     try:
         from aiogram.types import Update
         update = Update.model_validate(json_data, context={"bot": bot})
