@@ -6,7 +6,7 @@ import socket
 import sys
 import uuid
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 if sys.platform == "win32":
     try:
@@ -51,6 +51,31 @@ logger = logging.getLogger(__name__)
 # Швидкий кеш в оперативній пам'яті (0ms) для миттєвих відповідей користувачеві
 RAM_DRAFTS: Dict[str, Dict[str, Any]] = {}
 RAM_USER_STATES: Dict[int, Dict[str, Any]] = {}
+RAM_CATEGORIES_CACHE: Dict[tuple, List[str]] = {}
+
+
+def get_user_categories_fast(user_id: int, tx_type: str) -> List[str]:
+    """Повертає категорії миттєво з RAM (0ms) без запитів до диска."""
+    key = (user_id, tx_type)
+    if key in RAM_CATEGORIES_CACHE:
+        return RAM_CATEGORIES_CACHE[key]
+    cats = database.get_user_categories(user_id, tx_type)
+    RAM_CATEGORIES_CACHE[key] = cats
+    return cats
+
+
+def invalidate_categories_cache(user_id: int):
+    """Скидає кеш категорій користувача при додаванні/видаленні."""
+    RAM_CATEGORIES_CACHE.pop((user_id, "expense"), None)
+    RAM_CATEGORIES_CACHE.pop((user_id, "income"), None)
+
+
+async def async_save_draft_type(draft_id: str, tx_type: str):
+    """Фонове оновлення типу чернетки в базі без блокування користувача."""
+    try:
+        database.update_draft_type(draft_id, tx_type)
+    except Exception as e:
+        logger.warning(f"Фонове оновлення типу чернетки: {e}")
 
 
 def get_draft_fast(draft_id: str) -> Optional[Dict[str, Any]]:
@@ -275,12 +300,14 @@ async def handle_stats_callback(callback: CallbackQuery):
 # Обробка вибору типу (Витрата / Дохід)
 @dp.callback_query(F.data.startswith("type:"))
 async def handle_type_callback(callback: CallbackQuery):
-    cleanup_old_drafts()
+    # 1. МИТТЄВО знімаємо анімацію натискання з кнопки (відгук за 15-20мс)
+    await callback.answer()
+
     _, draft_id, tx_type = callback.data.split(":")
     
     draft = get_draft_fast(draft_id)
     if not draft:
-        await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
+        await callback.message.edit_text("⏳ Час вибору минув, введіть суму знову.")
         return
 
     draft["type"] = tx_type
@@ -293,26 +320,24 @@ async def handle_type_callback(callback: CallbackQuery):
         f"Оберіть категорію:"
     ).replace(",", " ")
 
-    categories = database.get_user_categories(callback.from_user.id, tx_type)
+    # Категорії беремо миттєво з пам'яті RAM (0 мс)
+    categories = get_user_categories_fast(callback.from_user.id, tx_type)
     
-    # МИТТЄВО відправляємо кнопки вибору категорій:
+    # 2. МИТТЄВО відправляємо кнопки вибору категорій:
     await callback.message.edit_text(text, reply_markup=get_category_keyboard(draft_id, tx_type, categories))
-    await callback.answer()
 
-    # Оновлюємо тип у фоні:
-    try:
-        database.update_draft_type(draft_id, tx_type)
-    except Exception:
-        pass
+    # 3. Запис у базу — повністю на фоні (не блокує екран користувача):
+    asyncio.create_task(async_save_draft_type(draft_id, tx_type))
 
 
 # Обробка кнопки "Назад" до вибору типу
 @dp.callback_query(F.data.startswith("back:"))
 async def handle_back_callback(callback: CallbackQuery):
+    await callback.answer()
     draft_id = callback.data.split(":")[1]
     draft = get_draft_fast(draft_id)
     if not draft:
-        await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
+        await callback.message.edit_text("⏳ Час вибору минув, введіть суму знову.")
         return
 
     safe_desc = html.escape(draft.get('description', '')) if draft.get('description') else ""
@@ -324,22 +349,24 @@ async def handle_back_callback(callback: CallbackQuery):
     ).replace(",", " ")
 
     await callback.message.edit_text(text, reply_markup=get_type_selection_keyboard(draft_id))
-    await callback.answer()
 
 
 # Обробка збереження категорії
 @dp.callback_query(F.data.startswith("cat:"))
 async def handle_category_callback(callback: CallbackQuery):
+    # 1. МИТТЄВО знімаємо анімацію натискання
+    await callback.answer("Збережено!")
+
     _, draft_id, cat_idx_str = callback.data.split(":")
     cat_idx = int(cat_idx_str)
 
     draft = get_draft_fast(draft_id)
     if not draft:
-        await callback.answer("⏳ Час вибору минув, введіть суму знову.", show_alert=True)
+        await callback.message.edit_text("⏳ Час вибору минув, введіть суму знову.")
         return
 
     tx_type = draft.get("type") or "expense"
-    categories = database.get_user_categories(callback.from_user.id, tx_type)
+    categories = get_user_categories_fast(callback.from_user.id, tx_type)
     if 0 <= cat_idx < len(categories):
         category = categories[cat_idx]
     else:
@@ -347,7 +374,7 @@ async def handle_category_callback(callback: CallbackQuery):
 
     delete_draft_fast(draft_id)
 
-    # 1. Записуємо в БД
+    # Запис операції у SQLite (з synchronous=NORMAL це лише ~1-2мс)
     tx_id = database.add_transaction(
         user_id=callback.from_user.id,
         amount=draft["amount"],
@@ -367,19 +394,18 @@ async def handle_category_callback(callback: CallbackQuery):
         f"{desc_line}"
     ).replace(",", " ")
 
-    # МИТТЄВО показуємо результат і завершуємо анімацію кнопки:
+    # МИТТЄВО показуємо результат:
     await callback.message.edit_text(text, reply_markup=get_delete_transaction_keyboard(tx_id))
-    await callback.answer("Збережено!")
 
 
 # Скасування додавання операції
 @dp.callback_query(F.data.startswith("cancel:"))
 async def handle_cancel_callback(callback: CallbackQuery):
+    await callback.answer()
     draft_id = callback.data.split(":")[1]
     delete_draft_fast(draft_id)
     clear_user_state_fast(callback.from_user.id)
     await callback.message.edit_text("❌ Додавання операції скасовано.")
-    await callback.answer()
 
 
 # Натискання "➕ Своя категорія" під час створення операції
@@ -390,19 +416,6 @@ async def handle_new_cat_callback(callback: CallbackQuery):
         "draft_id": draft_id,
         "type": tx_type
     })
-    type_name = "витрат" if tx_type == "expense" else "доходів"
-    
-    text = (
-        f"✍️ <b>Введіть назву вашої категорії для {type_name}:</b>\n\n"
-        f"<i>Наприклад: Книги, Сім'я, Косметика...</i>"
-    )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"back:{draft_id}")]
-        ]
-    )
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
     type_name = "витрат" if tx_type == "expense" else "доходів"
     
     text = (
@@ -467,6 +480,7 @@ async def handle_add_cat_menu_callback(callback: CallbackQuery):
 async def handle_del_cat_callback(callback: CallbackQuery):
     cat_id = int(callback.data.split(":")[1])
     database.delete_custom_category(callback.from_user.id, cat_id)
+    invalidate_categories_cache(callback.from_user.id)
     
     # Оновлюємо перелік
     custom_categories = database.get_custom_categories(callback.from_user.id)
@@ -538,6 +552,7 @@ async def handle_text_message(message: Message):
         tx_type = user_state["type"]
         new_category = raw_name
         database.add_custom_category(message.from_user.id, tx_type, new_category)
+        invalidate_categories_cache(message.from_user.id)
 
         draft_id = user_state.get("draft_id")
         draft = database.get_draft(draft_id) if draft_id else None
